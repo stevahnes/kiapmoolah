@@ -1,3 +1,4 @@
+
 // ==============================================================================
 // CONFIGURATION - REPLACE WITH YOUR KEYS
 // ==============================================================================
@@ -6,17 +7,11 @@ const OPENAI_API_KEY = "YOUR_API_KEY";
 const WEBAPP_URL = "YOUR_WEBAPP_URL";
 const SPREADSHEET_ID = "YOUR_SHEET_ID";
 
-// Security: pick your own random string. Apps Script web apps can't read HTTP
-// headers, so Telegram's header-based secret_token can't be checked here —
-// this is appended as a URL query param on the webhook instead (see
-// setTelegramWebhook) and validated in doPost so random POSTs to WEBAPP_URL
-// can't mutate your sheet.
+// Security: use your own random string.
 const WEBHOOK_SECRET = "RANDOM_STRING";
 
 // Only these Telegram chat IDs may use the bot / receive the daily summary.
-// Find your own chat_id by messaging the bot once, then checking Logger.log
-// (Executions tab) or https://api.telegram.org/bot<token>/getUpdates.
-const ALLOWED_CHAT_IDS = ["YOUR_CHAT_ID"]; // strings, e.g. ["123456789"]
+const ALLOWED_CHAT_IDS = ["YOUR_CHAT_ID"];
 
 // Sheet Tab Names
 const DASHBOARD_TAB = "DASHBOARD_SHEET_NAME";
@@ -29,9 +24,8 @@ const MCC_API_URL = "YOUR_MCC_CHECKER_SERVICE_URL";
 // ==============================================================================
 function doPost(e) {
   try {
-    // Reject anything without the shared secret so random POSTs to WEBAPP_URL
-    // can't append/delete/reclassify rows. Set via setTelegramWebhook().
     const suppliedSecret = e.parameter && e.parameter.secret;
+
     if (suppliedSecret !== WEBHOOK_SECRET) {
       Logger.log("Rejected webhook call: bad or missing secret");
       return HtmlService.createHtmlOutput("OK");
@@ -42,10 +36,12 @@ function doPost(e) {
     // Handle interactive button taps
     if (data.callback_query) {
       const cqChatId = data.callback_query.message.chat.id.toString();
+
       if (ALLOWED_CHAT_IDS.indexOf(cqChatId) === -1) {
         Logger.log("Rejected callback_query from unauthorized chat: " + cqChatId);
         return HtmlService.createHtmlOutput("OK");
       }
+
       handleCallbackQuery(data.callback_query);
       return HtmlService.createHtmlOutput("OK");
     }
@@ -66,19 +62,20 @@ function doPost(e) {
 
     // Handle /start command
     if (textPrompt.trim().toLowerCase() === "/start") {
-      const welcomeMsg = `👋 *Wah, spending again?*\n\n` +
-                         `Welcome to *Kiap Moolah*! I'm here to make sure your budget doesn't magically disappear.\n\n` +
-                         `👇 *How to log an expense:*\n` +
-                         `1️⃣ *Text me:* "Kopi $1.50"\n` +
-                         `2️⃣ *Snap a pic:* Send any PayNow or bank screenshot.\n\n` +
-                         `I'll do the math and let you know your daily quota. Try sending your first expense now!`;
+      const welcomeMsg =
+        `👋 *Wah, spending again?*\n\n` +
+        `Welcome to *Kiap Moolah*! I'm here to make sure your budget doesn't magically disappear.\n\n` +
+        `👇 *How to log an expense:*\n` +
+        `1️⃣ *Text me:* "Kopi $1.50 DBS Visa"\n` +
+        `2️⃣ *Snap a pic:* Send any PayNow or bank screenshot.\n\n` +
+        `I'll do the math and let you know your daily quota. Try sending your first expense now!`;
+
       sendTelegramMessage(chatId, welcomeMsg);
       return HtmlService.createHtmlOutput("OK");
     }
 
+    // Handle photo uploads
     if (message.photo) {
-      // message.photo is ordered smallest -> largest. Skip the largest size;
-      // one step down is still plenty legible for OCR and cheaper to transfer.
       const photoArray = message.photo;
       const fileId = photoArray[Math.max(0, photoArray.length - 2)].file_id;
 
@@ -86,6 +83,7 @@ function doPost(e) {
         `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`,
         { muteHttpExceptions: true }
       );
+
       const fileJson = JSON.parse(fileRes.getContentText());
 
       if (!fileJson.ok) {
@@ -98,6 +96,7 @@ function doPost(e) {
         `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${fileJson.result.file_path}`,
         { muteHttpExceptions: true }
       );
+
       if (imgRes.getResponseCode() !== 200) {
         Logger.log("Telegram file download failed: " + imgRes.getResponseCode());
         sendTelegramMessage(chatId, "⚠️ Couldn't download that photo. Please try sending it again.");
@@ -105,8 +104,6 @@ function doPost(e) {
       }
 
       base64Image = Utilities.base64Encode(imgRes.getContent());
-      // Telegram always serves photos as JPEG, but its file server reports
-      // application/octet-stream, which OpenAI rejects. Hardcode the real type.
       mimeType = "image/jpeg";
     }
 
@@ -117,6 +114,7 @@ function doPost(e) {
 
     // Call OpenAI API to classify expense
     let parsed;
+
     try {
       parsed = parseExpenseWithOpenAI(textPrompt, base64Image, mimeType);
     } catch (apiErr) {
@@ -125,45 +123,88 @@ function doPost(e) {
       return HtmlService.createHtmlOutput("OK");
     }
 
-    if (!parsed || typeof parsed.amount !== "number" || !parsed.subcategory) {
+    if (
+      !parsed ||
+      typeof parsed.amount !== "number" ||
+      !Number.isFinite(parsed.amount) ||
+      parsed.amount <= 0 ||
+      !parsed.subcategory
+    ) {
       Logger.log("Unparseable OpenAI result: " + JSON.stringify(parsed));
       sendTelegramMessage(chatId, "⚠️ Couldn't parse expense details. Please try again.");
       return HtmlService.createHtmlOutput("OK");
     }
 
-    // Lock around append+read-last-row so two near-simultaneous messages
-    // can't interleave and hand out the same/wrong row number to their
-    // Confirm/Reclass/Delete buttons.
+    // Default optional fields
+    parsed.merchant = parsed.merchant || "";
+    parsed.payment_method = parsed.payment_method || "";
+    parsed.description = parsed.description || "Expense";
+
+    // Lock around append + row lookup
     const lock = LockService.getScriptLock();
     let rowNumber;
+
     try {
       lock.waitLock(10000);
+
       const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
       const trackerSheet = ss.getSheetByName(TRACKER_TAB);
-      const todayStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
 
-      trackerSheet.appendRow([todayStr, parsed.subcategory, parsed.amount, parsed.description, "Telegram Bot"]);
+      const todayStr = Utilities.formatDate(
+        new Date(),
+        Session.getScriptTimeZone(),
+        "yyyy-MM-dd"
+      );
+
+      // Columns:
+      // A: Date
+      // B: Subcategory
+      // C: Amount
+      // D: Description
+      // E: Source
+      // F: Payment Method
+      trackerSheet.appendRow([
+        todayStr,
+        parsed.subcategory,
+        parsed.amount,
+        parsed.description,
+        "Telegram Bot",
+        parsed.payment_method
+      ]);
+
       SpreadsheetApp.flush();
       rowNumber = trackerSheet.getLastRow();
+
     } catch (lockErr) {
       Logger.log("Sheet write failed: " + lockErr.toString());
       sendTelegramMessage(chatId, "⚠️ Couldn't save that expense. Please try again.");
       return HtmlService.createHtmlOutput("OK");
+
     } finally {
-      lock.releaseLock();
+      if (lock.hasLock()) lock.releaseLock();
     }
 
-    const replyMsg = buildLoggedMessage("✅ *Logged Expense!*", parsed.description, parsed.subcategory, parsed.amount, parsed.merchant, "");
+    const replyMsg = buildLoggedMessage(
+      "✅ *Logged Expense!*",
+      parsed.description,
+      parsed.subcategory,
+      parsed.amount,
+      parsed.merchant,
+      "",
+      parsed.payment_method
+    );
+
     sendTelegramWithButtons(chatId, replyMsg, rowNumber);
 
   } catch (err) {
     Logger.log("Error in doPost: " + err.toString() + "\n" + (err.stack || ""));
   }
+
   return HtmlService.createHtmlOutput("OK");
 }
 
 // ==============================================================================
-// 2. BUTTON CALLBACK PROCESSOR (CHECK MCC, CONFIRM, RECLASS, DELETE)
+// 2. BUTTON CALLBACK PROCESSOR
 // ==============================================================================
 function handleCallbackQuery(callback) {
   const callbackId = callback.id;
@@ -174,7 +215,7 @@ function handleCallbackQuery(callback) {
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
   const trackerSheet = ss.getSheetByName(TRACKER_TAB);
 
-  // 1. User taps "Confirm"
+  // 1. Confirm
   if (actionData.startsWith("confirm_")) {
     answerCallbackQuery(callbackId, "✅ Locked & Confirmed!");
     removeInlineKeyboard(chatId, messageId);
@@ -183,29 +224,46 @@ function handleCallbackQuery(callback) {
 
   answerCallbackQuery(callbackId);
 
-  // 2. User taps "Check MCC" -> look up, show result, keep the other buttons
+  // 2. Check MCC
   if (actionData.startsWith("mcc_")) {
-    const rowNum = parseInt(actionData.split("_")[1]);
+    const rowNum = parseInt(actionData.split("_")[1], 10);
+
     if (rowNum > 1 && rowNum <= trackerSheet.getLastRow()) {
       const subcat = trackerSheet.getRange(rowNum, 2).getValue();
       const amount = parseFloat(trackerSheet.getRange(rowNum, 3).getValue());
       const desc = trackerSheet.getRange(rowNum, 4).getValue();
+      const paymentMethod = trackerSheet.getRange(rowNum, 6).getValue();
 
       const msgText = callback.message.text || "";
       const merchant = extractField(msgText, "Merchant");
       const mccText = formatMccResults(lookupMcc(merchant || desc));
 
-      const updatedMsg = buildLoggedMessage("✅ *Logged Expense!*", desc, subcat, amount, merchant, mccText);
+      const updatedMsg = buildLoggedMessage(
+        "✅ *Logged Expense!*",
+        desc,
+        subcat,
+        amount,
+        merchant,
+        mccText,
+        paymentMethod
+      );
+
       editTelegramMessage(chatId, messageId, updatedMsg, buildKeyboard(rowNum, false));
     }
+
     return;
   }
 
-  // 3. User taps a Category to Reclassify
+  // 3. Reclassify
   if (actionData.startsWith("reclass_")) {
     const firstUnderscore = actionData.indexOf("_");
     const secondUnderscore = actionData.indexOf("_", firstUnderscore + 1);
-    const rowNum = parseInt(actionData.substring(firstUnderscore + 1, secondUnderscore));
+
+    const rowNum = parseInt(
+      actionData.substring(firstUnderscore + 1, secondUnderscore),
+      10
+    );
+
     const newSubcat = actionData.substring(secondUnderscore + 1);
 
     if (rowNum > 1 && rowNum <= trackerSheet.getLastRow()) {
@@ -214,23 +272,30 @@ function handleCallbackQuery(callback) {
 
       const itemDesc = trackerSheet.getRange(rowNum, 4).getValue();
       const amount = parseFloat(trackerSheet.getRange(rowNum, 3).getValue());
+      const paymentMethod = trackerSheet.getRange(rowNum, 6).getValue();
 
-      // Carry over merchant / MCC lines if they were already on the message
       const msgText = callback.message.text || "";
       const merchant = extractField(msgText, "Merchant");
       const mccText = extractField(msgText, "MCC");
 
-      const updatedMsg = buildLoggedMessage("✏️ *Reclassified & Locked!*", itemDesc, newSubcat, amount, merchant, mccText);
+      const updatedMsg = buildLoggedMessage(
+        "✏️ *Reclassified & Locked!*",
+        itemDesc,
+        newSubcat,
+        amount,
+        merchant,
+        mccText,
+        paymentMethod
+      );
+
       editTelegramMessage(chatId, messageId, updatedMsg);
-      // Lock the message after reclassify so stale row-number buttons
-      // (which go wrong once a delete shifts rows) can't be tapped again.
       removeInlineKeyboard(chatId, messageId);
     }
   }
 
-  // 4. User taps "Delete / Undo"
+  // 4. Delete / Undo
   else if (actionData.startsWith("delete_")) {
-    const rowNum = parseInt(actionData.split("_")[1]);
+    const rowNum = parseInt(actionData.split("_")[1], 10);
 
     if (rowNum > 1 && rowNum <= trackerSheet.getLastRow()) {
       const itemDesc = trackerSheet.getRange(rowNum, 4).getValue();
@@ -239,12 +304,12 @@ function handleCallbackQuery(callback) {
       trackerSheet.deleteRow(rowNum);
       SpreadsheetApp.flush();
 
-      editTelegramMessage(chatId, messageId, `🗑️ *Deleted!* Removed *$${amount}* (${escapeMd(itemDesc)}) from your tracker.`);
-      // Rows below this one just shifted up by one, so this message's own
-      // buttons (and any other still-live message pointing at a row below
-      // rowNum) would now target the wrong expense. Lock this message;
-      // there's no cheap way to fix the other messages without a stable
-      // per-row ID, so avoid deleting/reclassifying out of order where possible.
+      editTelegramMessage(
+        chatId,
+        messageId,
+        `🗑️ *Deleted!* Removed *$${amount}* (${escapeMd(itemDesc)}) from your tracker.`
+      );
+
       removeInlineKeyboard(chatId, messageId);
     }
   }
@@ -257,25 +322,45 @@ function parseExpenseWithOpenAI(textPrompt, base64Image, mimeType) {
   const url = "https://api.openai.com/v1/chat/completions";
 
   const systemInstruction = `You are a financial bot for a user in Singapore.
+
 Extract transaction details and classify into EXACTLY ONE of these specific subcategories based on intent:
+
 1. "Variable Monthly Needs" (Day-to-day essentials, food, transport, groceries)
 2. "Variable Investments" (Ad-hoc stocks, crypto, extra savings)
 3. "Variable Monthly Wants" (Shopping, gadgets, entertainment, luxury)
+
+Also extract the payment method.
+
+Payment method rules:
+- Identify the card, account, or payment method used.
+- Examples: "DBS Visa", "UOB One", "OCBC Debit", "Apple Pay", "Cash", "PayNow".
+- If Apple Pay is used and the underlying card is identifiable, return the card name rather than simply "Apple Pay".
+- If both wallet and underlying card are identifiable, prefer the underlying card.
+- Never infer payment method from the merchant.
+- Return an empty string if payment method cannot be identified.
+- Preserve the recognizable card or account name.
 
 Return strictly JSON with this exact schema:
 {
   "subcategory": "Variable Monthly Needs" | "Variable Investments" | "Variable Monthly Wants",
   "amount": <number>,
   "description": "<short exact description of purchase>",
-  "merchant": "<store/merchant name only, without the item, e.g. 'Marks & Spencer' or 'Cold Storage'; empty string if none is identifiable>"
+  "merchant": "<store/merchant name only, without the item; empty string if none is identifiable>",
+  "payment_method": "<payment method; empty string if unknown>"
 }`;
 
   const userContent = [];
 
   if (textPrompt) {
-    userContent.push({ type: "text", text: `User Input: ${textPrompt}` });
+    userContent.push({
+      type: "text",
+      text: `User Input: ${textPrompt}`
+    });
   } else {
-    userContent.push({ type: "text", text: "Extract transaction details from this image." });
+    userContent.push({
+      type: "text",
+      text: "Extract transaction details from this image."
+    });
   }
 
   if (base64Image) {
@@ -283,8 +368,6 @@ Return strictly JSON with this exact schema:
       type: "image_url",
       image_url: {
         url: `data:${mimeType};base64,${base64Image}`,
-        // "low" fixes token cost regardless of source resolution (no tiling).
-        // Bump to "high" only if receipt text is small enough to misread at low detail.
         detail: "low"
       }
     });
@@ -320,9 +403,15 @@ Return strictly JSON with this exact schema:
   }
 
   const jsonRes = JSON.parse(body);
-  if (jsonRes.choices && jsonRes.choices[0] && jsonRes.choices[0].message) {
+
+  if (
+    jsonRes.choices &&
+    jsonRes.choices[0] &&
+    jsonRes.choices[0].message
+  ) {
     return JSON.parse(jsonRes.choices[0].message.content);
   }
+
   Logger.log("OpenAI returned no choices: " + body.substring(0, 1000));
   return null;
 }
@@ -332,21 +421,27 @@ Return strictly JSON with this exact schema:
 // ==============================================================================
 function lookupMcc(query) {
   if (!query) return [];
+
   try {
     const url = MCC_API_URL + encodeURIComponent(query).replace(/%20/g, "+");
+
     const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
     const code = res.getResponseCode();
     const body = res.getContentText();
+
     Logger.log(`MCC lookup "${query}" -> HTTP ${code}: ${body.substring(0, 500)}`);
+
     if (code !== 200) return [];
 
     const json = JSON.parse(body);
     const list = Array.isArray(json.merchants) ? json.merchants : [];
+
     return list.slice(0, 3).map(m => ({
       mcc: m.MCC || "",
       name: m.displayName || m.Store || "",
       category: m.Category || ""
     })).filter(r => r.mcc !== "");
+
   } catch (err) {
     Logger.log("MCC lookup failed: " + err.toString());
     return [];
@@ -355,11 +450,18 @@ function lookupMcc(query) {
 
 function formatMccResults(results) {
   if (!results.length) return "No match found";
+
   return results.map(r => {
     let s = `${r.mcc}`;
+
     if (r.name) s += ` (${r.name}`;
-    if (r.category) s += r.name ? ` - ${r.category})` : ` (${r.category})`;
-    else if (r.name) s += ")";
+
+    if (r.category) {
+      s += r.name ? ` - ${r.category})` : ` (${r.category})`;
+    } else if (r.name) {
+      s += ")";
+    }
+
     return s;
   }).join(" | ");
 }
@@ -367,27 +469,40 @@ function formatMccResults(results) {
 // ==============================================================================
 // 5. MESSAGE / TEXT HELPERS
 // ==============================================================================
-// Legacy Telegram Markdown fails the whole message on stray _ * ` [
 function escapeMd(s) {
   return String(s).replace(/([_*`\[])/g, "\\$1");
 }
 
-// Pulls "<label>: value" back out of the plain-text callback.message.text
 function extractField(text, label) {
-  const m = (text || "").match(new RegExp(label + ": (.+)"));
+  const m = (text || "").match(
+    new RegExp(label + ": (.+)")
+  );
+
   return m ? m[1].trim() : "";
 }
 
-function buildLoggedMessage(header, description, subcategory, amount, merchant, mccText) {
+function buildLoggedMessage(
+  header,
+  description,
+  subcategory,
+  amount,
+  merchant,
+  mccText,
+  paymentMethod
+) {
   const stats = getSubcategoryStats(subcategory);
-  return (`${header}\n\n` +
-          `📝 *Item:* ${escapeMd(description)}\n` +
-          (merchant ? `🏪 *Merchant:* ${escapeMd(merchant)}\n` : "") +
-          (mccText ? `🔎 *MCC:* ${escapeMd(mccText)}\n` : "") +
-          `🏷️ *Bucket:* ${subcategory}\n` +
-          `💰 *Amount:* $${amount.toFixed(2)}\n\n` +
-          `📊 *${subcategory} Remaining:* $${stats.remaining.toFixed(2)}\n` +
-          stats.quotaText).trim();
+
+  return (
+    `${header}\n\n` +
+    `📝 *Item:* ${escapeMd(description)}\n` +
+    (merchant ? `🏪 *Merchant:* ${escapeMd(merchant)}\n` : "") +
+    (paymentMethod ? `💳 *Payment Method:* ${escapeMd(paymentMethod)}\n` : "") +
+    (mccText ? `🔎 *MCC:* ${escapeMd(mccText)}\n` : "") +
+    `🏷️ *Bucket:* ${subcategory}\n` +
+    `💰 *Amount:* $${amount.toFixed(2)}\n\n` +
+    `📊 *${subcategory} Remaining:* $${stats.remaining.toFixed(2)}\n` +
+    stats.quotaText
+  ).trim();
 }
 
 // ==============================================================================
@@ -397,6 +512,7 @@ function getSubcategoryStats(subcategory) {
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
   const dashboardSheet = ss.getSheetByName(DASHBOARD_TAB);
   const data = dashboardSheet.getDataRange().getValues();
+
   let remaining = 0;
   let quota = "—";
 
@@ -408,43 +524,64 @@ function getSubcategoryStats(subcategory) {
     }
   }
 
-  // Dashboard quota is only used as a "this bucket has a daily quota" flag.
-  // The actual number is computed below so it stays fixed through the day.
   let quotaText = "";
+
   if (quota !== "" && quota !== "—" && !isNaN(quota)) {
     const now = new Date();
-    const totalDaysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-    const daysLeft = totalDaysInMonth - now.getDate() + 1; // includes today
+
+    const totalDaysInMonth = new Date(
+      now.getFullYear(),
+      now.getMonth() + 1,
+      0
+    ).getDate();
+
+    const daysLeft = totalDaysInMonth - now.getDate() + 1;
 
     const spentToday = getSpentToday(ss, subcategory);
-    const dailyRate = (remaining + spentToday) / daysLeft; // fixed for the day
+
+    const dailyRate = (remaining + spentToday) / daysLeft;
     const quotaLeft = dailyRate - spentToday;
 
-    quotaText = `🎯 *Daily Quota Left:* $${quotaLeft.toFixed(2)} (of $${dailyRate.toFixed(2)}/day)`;
+    quotaText =
+      `🎯 *Daily Quota Left:* $${quotaLeft.toFixed(2)} ` +
+      `(of $${dailyRate.toFixed(2)}/day)`;
   }
-  return { remaining: remaining, quotaText: quotaText };
+
+  return {
+    remaining: remaining,
+    quotaText: quotaText
+  };
 }
 
-// Sum of today's tracker rows for a subcategory (col A date, B subcategory, C amount)
+// Sum of today's tracker rows for a subcategory
 function getSpentToday(ss, subcategory) {
   const sheet = ss.getSheetByName(TRACKER_TAB);
   const lastRow = sheet.getLastRow();
+
   if (lastRow < 2) return 0;
 
   const tz = Session.getScriptTimeZone();
-  const todayStr = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
+
+  const todayStr = Utilities.formatDate(
+    new Date(),
+    tz,
+    "yyyy-MM-dd"
+  );
+
   const rows = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
 
   let total = 0;
+
   rows.forEach(r => {
-    // appendRow of "yyyy-MM-dd" is usually auto-converted to a Date by Sheets
     const rowDate = r[0] instanceof Date
       ? Utilities.formatDate(r[0], tz, "yyyy-MM-dd")
       : String(r[0]).trim();
+
     if (rowDate === todayStr && r[1] === subcategory) {
       total += parseFloat(r[2]) || 0;
     }
   });
+
   return total;
 }
 
@@ -454,19 +591,28 @@ function getSpentToday(ss, subcategory) {
 function sendDailySummary() {
   const needsStats = getSubcategoryStats("Variable Monthly Needs");
   const wantsStats = getSubcategoryStats("Variable Monthly Wants");
+
   const today = new Date();
-  const totalDaysInMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
+
+  const totalDaysInMonth = new Date(
+    today.getFullYear(),
+    today.getMonth() + 1,
+    0
+  ).getDate();
+
   const daysRemaining = totalDaysInMonth - today.getDate() + 1;
 
-  const message = `☀️ *Good Morning! Daily Budget Status*\n\n` +
-                  `💳 *Needs Remaining:* $${needsStats.remaining.toFixed(2)}\n` +
-                  (needsStats.quotaText ? `${needsStats.quotaText}\n\n` : "\n") +
-                  `🛍️ *Wants Remaining:* $${wantsStats.remaining.toFixed(2)}\n` +
-                  `🗓️ *Days Left in Month:* ${daysRemaining}\n\n` +
-                  `_Send a PayNow screenshot or text to log expenses today!_`;
+  const message =
+    `☀️ *Good Morning! Daily Budget Status*\n\n` +
+    `💳 *Needs Remaining:* $${needsStats.remaining.toFixed(2)}\n` +
+    (needsStats.quotaText ? `${needsStats.quotaText}\n\n` : "\n") +
+    `🛍️ *Wants Remaining:* $${wantsStats.remaining.toFixed(2)}\n` +
+    `🗓️ *Days Left in Month:* ${daysRemaining}\n\n` +
+    `_Send a PayNow screenshot or text to log expenses today!_`;
 
-  // Sent to every allow-listed chat, not just whoever messaged most recently.
-  ALLOWED_CHAT_IDS.forEach(chatId => sendTelegramMessage(chatId, message));
+  ALLOWED_CHAT_IDS.forEach(chatId => {
+    sendTelegramMessage(chatId, message);
+  });
 }
 
 // ==============================================================================
@@ -484,69 +630,139 @@ function buildKeyboard(rowNumber, includeMcc) {
       { text: "❌ Undo", callback_data: `delete_${rowNumber}` }
     ]
   ];
-  if (includeMcc) keyboard.unshift([{ text: "🔎 Check MCC", callback_data: `mcc_${rowNumber}` }]);
+
+  if (includeMcc) {
+    keyboard.unshift([
+      { text: "🔎 Check MCC", callback_data: `mcc_${rowNumber}` }
+    ]);
+  }
+
   return keyboard;
 }
 
 function sendTelegramWithButtons(chatId, text, rowNumber) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
   const payload = {
     chat_id: chatId,
     text: text,
     parse_mode: "Markdown",
-    reply_markup: { inline_keyboard: buildKeyboard(rowNumber, true) }
+    reply_markup: {
+      inline_keyboard: buildKeyboard(rowNumber, true)
+    }
   };
-  const res = UrlFetchApp.fetch(url, { method: "post", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true });
-  if (res.getResponseCode() !== 200) Logger.log("sendMessage failed: " + res.getContentText());
-}
 
-function editTelegramMessage(chatId, messageId, text, keyboard) {
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`;
-  const payload = { chat_id: chatId, message_id: messageId, text: text, parse_mode: "Markdown" };
-  if (keyboard) payload.reply_markup = { inline_keyboard: keyboard };
   const res = UrlFetchApp.fetch(url, {
     method: "post",
     contentType: "application/json",
     payload: JSON.stringify(payload),
     muteHttpExceptions: true
   });
-  if (res.getResponseCode() !== 200) Logger.log("editMessageText failed: " + res.getContentText());
+
+  if (res.getResponseCode() !== 200) {
+    Logger.log("sendMessage failed: " + res.getContentText());
+  }
+}
+
+function editTelegramMessage(chatId, messageId, text, keyboard) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`;
+
+  const payload = {
+    chat_id: chatId,
+    message_id: messageId,
+    text: text,
+    parse_mode: "Markdown"
+  };
+
+  if (keyboard) {
+    payload.reply_markup = {
+      inline_keyboard: keyboard
+    };
+  }
+
+  const res = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  if (res.getResponseCode() !== 200) {
+    Logger.log("editMessageText failed: " + res.getContentText());
+  }
 }
 
 function removeInlineKeyboard(chatId, messageId) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`;
+
   UrlFetchApp.fetch(url, {
     method: "post",
     contentType: "application/json",
-    payload: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }),
+    payload: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: { inline_keyboard: [] }
+    }),
     muteHttpExceptions: true
   });
 }
 
 function answerCallbackQuery(callbackId, text = "") {
-  const payload = { callback_query_id: callbackId };
+  const payload = {
+    callback_query_id: callbackId
+  };
+
   if (text) payload.text = text;
+
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`;
-  UrlFetchApp.fetch(url, { method: "post", contentType: "application/json", payload: JSON.stringify(payload), muteHttpExceptions: true });
+
+  UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
 }
 
 function sendTelegramMessage(chatId, text) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  UrlFetchApp.fetch(url, { method: "post", contentType: "application/json", payload: JSON.stringify({ chat_id: chatId, text: text, parse_mode: "Markdown" }), muteHttpExceptions: true });
+
+  UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({
+      chat_id: chatId,
+      text: text,
+      parse_mode: "Markdown"
+    }),
+    muteHttpExceptions: true
+  });
 }
 
 // ==============================================================================
 // 9. SETUP UTILITIES
 // ==============================================================================
 function setTelegramWebhook() {
-  // Secret travels as a query param on the callback URL, since Apps Script
-  // web apps can't read the X-Telegram-Bot-Api-Secret-Token header Telegram
-  // would otherwise send. doPost() validates e.parameter.secret against it.
-  const callbackUrl = `${WEBAPP_URL}?secret=${encodeURIComponent(WEBHOOK_SECRET)}`;
-  Logger.log(UrlFetchApp.fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=${encodeURIComponent(callbackUrl)}`).getContentText());
+  const callbackUrl =
+    `${WEBAPP_URL}?secret=${encodeURIComponent(WEBHOOK_SECRET)}`;
+
+  const response = UrlFetchApp.fetch(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=${encodeURIComponent(callbackUrl)}`
+  );
+
+  Logger.log(response.getContentText());
 }
 
 function setupDailyTrigger() {
-  ScriptApp.getProjectTriggers().forEach(t => { if (t.getHandlerFunction() === "sendDailySummary") ScriptApp.deleteTrigger(t); });
-  ScriptApp.newTrigger("sendDailySummary").timeBased().everyDays(1).atHour(8).create();
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === "sendDailySummary") {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  ScriptApp.newTrigger("sendDailySummary")
+    .timeBased()
+    .everyDays(1)
+    .atHour(8)
+    .create();
 }
