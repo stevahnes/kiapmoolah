@@ -1,21 +1,23 @@
 
 // ==============================================================================
-// KIAP MOOLAH — CONFIGURATION
+// CONFIGURATION - REPLACE WITH YOUR KEYS
 // ==============================================================================
 const TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN";
 const OPENAI_API_KEY = "YOUR_API_KEY";
 const WEBAPP_URL = "YOUR_WEBAPP_URL";
 const SPREADSHEET_ID = "YOUR_SHEET_ID";
 
+// Security: use your own random string.
 const WEBHOOK_SECRET = "RANDOM_STRING";
+
+// Only these Telegram chat IDs may use the bot / receive the daily summary.
 const ALLOWED_CHAT_IDS = ["YOUR_CHAT_ID"];
 
+// Sheet Tab Names
 const DASHBOARD_TAB = "DASHBOARD_SHEET_NAME";
 const TRACKER_TAB = "TRACKER_SHEET_NAME";
 
 const MCC_API_URL = "YOUR_MCC_CHECKER_SERVICE_URL";
-
-const PENDING_EXPIRY_MS = 24 * 60 * 60 * 1000;
 
 // ==============================================================================
 // 1. MAIN TELEGRAM WEBHOOK HANDLER
@@ -25,106 +27,54 @@ function doPost(e) {
     const suppliedSecret = e.parameter && e.parameter.secret;
 
     if (suppliedSecret !== WEBHOOK_SECRET) {
-      Logger.log("Rejected webhook: invalid secret");
+      Logger.log("Rejected webhook call: bad or missing secret");
       return HtmlService.createHtmlOutput("OK");
     }
 
     const data = JSON.parse(e.postData.contents);
 
-    // --------------------------------------------------------------------------
-    // CALLBACK QUERIES
-    // --------------------------------------------------------------------------
+    // Handle interactive button taps
     if (data.callback_query) {
-      const callback = data.callback_query;
-      const chatId = callback.message.chat.id.toString();
+      const cqChatId = data.callback_query.message.chat.id.toString();
 
-      if (ALLOWED_CHAT_IDS.indexOf(chatId) === -1) {
-        Logger.log("Rejected callback from unauthorized chat: " + chatId);
+      if (ALLOWED_CHAT_IDS.indexOf(cqChatId) === -1) {
+        Logger.log("Rejected callback_query from unauthorized chat: " + cqChatId);
         return HtmlService.createHtmlOutput("OK");
       }
 
-      handleCallbackQuery(callback);
+      handleCallbackQuery(data.callback_query);
       return HtmlService.createHtmlOutput("OK");
     }
 
     if (!data.message) return HtmlService.createHtmlOutput("OK");
 
     const message = data.message;
-    const chatId = message.chat.id.toString();
+    const chatId = message.chat.id;
 
-    if (ALLOWED_CHAT_IDS.indexOf(chatId) === -1) {
+    if (ALLOWED_CHAT_IDS.indexOf(chatId.toString()) === -1) {
       Logger.log("Rejected message from unauthorized chat: " + chatId);
       return HtmlService.createHtmlOutput("OK");
     }
 
-    const textPrompt = message.text || message.caption || "";
+    let textPrompt = message.text || message.caption || "";
+    let base64Image = null;
+    let mimeType = "image/jpeg";
 
-    // --------------------------------------------------------------------------
-    // START COMMAND
-    // --------------------------------------------------------------------------
+    // Handle /start command
     if (textPrompt.trim().toLowerCase() === "/start") {
       const welcomeMsg =
         `👋 *Wah, spending again?*\n\n` +
         `Welcome to *Kiap Moolah*! I'm here to make sure your budget doesn't magically disappear.\n\n` +
         `👇 *How to log an expense:*\n` +
         `1️⃣ *Text me:* "Kopi $1.50 DBS Visa"\n` +
-        `2️⃣ *Snap a pic:* Send a PayNow or bank screenshot.\n\n` +
-        `If I need more information, I'll ask before logging the transaction.\n\n` +
-        `I'll do the math and let you know your daily quota.`;
+        `2️⃣ *Snap a pic:* Send any PayNow or bank screenshot.\n\n` +
+        `I'll do the math and let you know your daily quota. Try sending your first expense now!`;
 
       sendTelegramMessage(chatId, welcomeMsg);
       return HtmlService.createHtmlOutput("OK");
     }
 
-    // --------------------------------------------------------------------------
-    // CANCEL COMMAND
-    // --------------------------------------------------------------------------
-    if (textPrompt.trim().toLowerCase() === "/cancel") {
-      const existed = clearPendingTransaction(chatId);
-
-      sendTelegramMessage(
-        chatId,
-        existed
-          ? "🗑️ Pending transaction cancelled. Nothing was added to your tracker."
-          : "ℹ️ There is no pending transaction to cancel."
-      );
-
-      return HtmlService.createHtmlOutput("OK");
-    }
-
-    // --------------------------------------------------------------------------
-    // CHECK FOR PENDING CLARIFICATION
-    // --------------------------------------------------------------------------
-    const pendingState = getPendingTransactionState(chatId);
-
-    if (pendingState.status === "expired") {
-      sendTelegramMessage(
-        chatId,
-        "⌛ Your previous pending transaction has expired. Nothing was logged. Please resend the transaction if you still want to record it."
-      );
-
-      return HtmlService.createHtmlOutput("OK");
-    }
-
-    if (pendingState.status === "active") {
-      if (!message.text) {
-        sendTelegramMessage(
-          chatId,
-          "✍️ Please reply with the purpose of the pending transaction in text, or send /cancel."
-        );
-        return HtmlService.createHtmlOutput("OK");
-      }
-
-      handleClarificationReply(chatId, textPrompt);
-      return HtmlService.createHtmlOutput("OK");
-    }
-
-    // --------------------------------------------------------------------------
-    // DOWNLOAD PHOTO IF PROVIDED
-    // --------------------------------------------------------------------------
-    let base64Image = null;
-    let mimeType = "image/jpeg";
-
+    // Handle photo uploads
     if (message.photo) {
       const photoArray = message.photo;
       const fileId = photoArray[Math.max(0, photoArray.length - 2)].file_id;
@@ -138,7 +88,7 @@ function doPost(e) {
 
       if (!fileJson.ok) {
         Logger.log("Telegram getFile failed: " + fileRes.getContentText());
-        sendTelegramMessage(chatId, "⚠️ Couldn't download that photo. Please try again.");
+        sendTelegramMessage(chatId, "⚠️ Couldn't download that photo. Please try sending it again.");
         return HtmlService.createHtmlOutput("OK");
       }
 
@@ -148,8 +98,8 @@ function doPost(e) {
       );
 
       if (imgRes.getResponseCode() !== 200) {
-        Logger.log("Telegram image download failed: " + imgRes.getResponseCode());
-        sendTelegramMessage(chatId, "⚠️ Couldn't download that photo. Please try again.");
+        Logger.log("Telegram file download failed: " + imgRes.getResponseCode());
+        sendTelegramMessage(chatId, "⚠️ Couldn't download that photo. Please try sending it again.");
         return HtmlService.createHtmlOutput("OK");
       }
 
@@ -158,19 +108,17 @@ function doPost(e) {
     }
 
     if (!textPrompt && !base64Image) {
-      sendTelegramMessage(chatId, "⚠️ Please send an expense description or a transaction screenshot.");
+      sendTelegramMessage(chatId, "⚠️ Please send a text expense or a PayNow screenshot.");
       return HtmlService.createHtmlOutput("OK");
     }
 
-    // --------------------------------------------------------------------------
-    // PARSE TRANSACTION
-    // --------------------------------------------------------------------------
+    // Call OpenAI API to classify expense
     let parsed;
 
     try {
       parsed = parseExpenseWithOpenAI(textPrompt, base64Image, mimeType);
-    } catch (err) {
-      Logger.log("OpenAI parser error: " + err.toString());
+    } catch (apiErr) {
+      Logger.log("OpenAI call failed: " + apiErr.toString());
       sendTelegramMessage(chatId, "⚠️ Expense parser is temporarily unavailable. Please try again shortly.");
       return HtmlService.createHtmlOutput("OK");
     }
@@ -179,52 +127,61 @@ function doPost(e) {
       !parsed ||
       typeof parsed.amount !== "number" ||
       !Number.isFinite(parsed.amount) ||
-      parsed.amount <= 0
+      parsed.amount <= 0 ||
+      !parsed.subcategory
     ) {
-      Logger.log("Unparseable result: " + JSON.stringify(parsed));
-      sendTelegramMessage(chatId, "⚠️ Couldn't identify a valid transaction amount. Please try again.");
+      Logger.log("Unparseable OpenAI result: " + JSON.stringify(parsed));
+      sendTelegramMessage(chatId, "⚠️ Couldn't parse expense details. Please try again.");
       return HtmlService.createHtmlOutput("OK");
     }
 
-    // Normalise optional fields.
-    parsed.description = parsed.description || "";
+    // Default optional fields
     parsed.merchant = parsed.merchant || "";
-    parsed.counterparty = parsed.counterparty || "";
     parsed.payment_method = parsed.payment_method || "";
-    parsed.transaction_type = parsed.transaction_type || "Transaction";
+    parsed.description = parsed.description || "Expense";
 
-    // Keep only the last four account digits where identifiable.
-    parsed.payment_method = sanitisePaymentMethod(parsed.payment_method);
+    // Lock around append + row lookup
+    const lock = LockService.getScriptLock();
+    let rowNumber;
 
-    const validCategories = [
-      "Variable Monthly Needs",
-      "Variable Investments",
-      "Variable Monthly Wants"
-    ];
+    try {
+      lock.waitLock(10000);
 
-    const categoryValid =
-      validCategories.indexOf(parsed.subcategory) !== -1;
+      const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+      const trackerSheet = ss.getSheetByName(TRACKER_TAB);
 
-    // Ask for clarification when the purpose or category is unknown.
-    const needsClarification =
-      parsed.needs_clarification === true ||
-      !categoryValid ||
-      !parsed.description;
+      const todayStr = Utilities.formatDate(
+        new Date(),
+        Session.getScriptTimeZone(),
+        "yyyy-MM-dd"
+      );
 
-    if (needsClarification) {
-      savePendingTransaction(chatId, parsed);
-      askTransactionPurpose(chatId, parsed);
-      return HtmlService.createHtmlOutput("OK");
-    }
+      // Columns:
+      // A: Date
+      // B: Subcategory
+      // C: Amount
+      // D: Description
+      // E: Source
+      // F: Payment Method
+      trackerSheet.appendRow([
+        todayStr,
+        parsed.subcategory,
+        parsed.amount,
+        parsed.description,
+        "Telegram Bot",
+        parsed.payment_method
+      ]);
 
-    // --------------------------------------------------------------------------
-    // LOG DIRECT PURCHASE
-    // --------------------------------------------------------------------------
-    const rowNumber = saveExpenseToSheet(parsed);
+      SpreadsheetApp.flush();
+      rowNumber = trackerSheet.getLastRow();
 
-    if (!rowNumber) {
+    } catch (lockErr) {
+      Logger.log("Sheet write failed: " + lockErr.toString());
       sendTelegramMessage(chatId, "⚠️ Couldn't save that expense. Please try again.");
       return HtmlService.createHtmlOutput("OK");
+
+    } finally {
+      if (lock.hasLock()) lock.releaseLock();
     }
 
     const replyMsg = buildLoggedMessage(
@@ -234,8 +191,7 @@ function doPost(e) {
       parsed.amount,
       parsed.merchant,
       "",
-      parsed.payment_method,
-      parsed.counterparty
+      parsed.payment_method
     );
 
     sendTelegramWithButtons(chatId, replyMsg, rowNumber);
@@ -248,80 +204,149 @@ function doPost(e) {
 }
 
 // ==============================================================================
-// 2. OPENAI TRANSACTION PARSER
+// 2. BUTTON CALLBACK PROCESSOR
+// ==============================================================================
+function handleCallbackQuery(callback) {
+  const callbackId = callback.id;
+  const chatId = callback.message.chat.id;
+  const messageId = callback.message.message_id;
+  const actionData = callback.data;
+
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const trackerSheet = ss.getSheetByName(TRACKER_TAB);
+
+  // 1. Confirm
+  if (actionData.startsWith("confirm_")) {
+    answerCallbackQuery(callbackId, "✅ Locked & Confirmed!");
+    removeInlineKeyboard(chatId, messageId);
+    return;
+  }
+
+  answerCallbackQuery(callbackId);
+
+  // 2. Check MCC
+  if (actionData.startsWith("mcc_")) {
+    const rowNum = parseInt(actionData.split("_")[1], 10);
+
+    if (rowNum > 1 && rowNum <= trackerSheet.getLastRow()) {
+      const subcat = trackerSheet.getRange(rowNum, 2).getValue();
+      const amount = parseFloat(trackerSheet.getRange(rowNum, 3).getValue());
+      const desc = trackerSheet.getRange(rowNum, 4).getValue();
+      const paymentMethod = trackerSheet.getRange(rowNum, 6).getValue();
+
+      const msgText = callback.message.text || "";
+      const merchant = extractField(msgText, "Merchant");
+      const mccText = formatMccResults(lookupMcc(merchant || desc));
+
+      const updatedMsg = buildLoggedMessage(
+        "✅ *Logged Expense!*",
+        desc,
+        subcat,
+        amount,
+        merchant,
+        mccText,
+        paymentMethod
+      );
+
+      editTelegramMessage(chatId, messageId, updatedMsg, buildKeyboard(rowNum, false));
+    }
+
+    return;
+  }
+
+  // 3. Reclassify
+  if (actionData.startsWith("reclass_")) {
+    const firstUnderscore = actionData.indexOf("_");
+    const secondUnderscore = actionData.indexOf("_", firstUnderscore + 1);
+
+    const rowNum = parseInt(
+      actionData.substring(firstUnderscore + 1, secondUnderscore),
+      10
+    );
+
+    const newSubcat = actionData.substring(secondUnderscore + 1);
+
+    if (rowNum > 1 && rowNum <= trackerSheet.getLastRow()) {
+      trackerSheet.getRange(rowNum, 2).setValue(newSubcat);
+      SpreadsheetApp.flush();
+
+      const itemDesc = trackerSheet.getRange(rowNum, 4).getValue();
+      const amount = parseFloat(trackerSheet.getRange(rowNum, 3).getValue());
+      const paymentMethod = trackerSheet.getRange(rowNum, 6).getValue();
+
+      const msgText = callback.message.text || "";
+      const merchant = extractField(msgText, "Merchant");
+      const mccText = extractField(msgText, "MCC");
+
+      const updatedMsg = buildLoggedMessage(
+        "✏️ *Reclassified & Locked!*",
+        itemDesc,
+        newSubcat,
+        amount,
+        merchant,
+        mccText,
+        paymentMethod
+      );
+
+      editTelegramMessage(chatId, messageId, updatedMsg);
+      removeInlineKeyboard(chatId, messageId);
+    }
+  }
+
+  // 4. Delete / Undo
+  else if (actionData.startsWith("delete_")) {
+    const rowNum = parseInt(actionData.split("_")[1], 10);
+
+    if (rowNum > 1 && rowNum <= trackerSheet.getLastRow()) {
+      const itemDesc = trackerSheet.getRange(rowNum, 4).getValue();
+      const amount = trackerSheet.getRange(rowNum, 3).getValue();
+
+      trackerSheet.deleteRow(rowNum);
+      SpreadsheetApp.flush();
+
+      editTelegramMessage(
+        chatId,
+        messageId,
+        `🗑️ *Deleted!* Removed *$${amount}* (${escapeMd(itemDesc)}) from your tracker.`
+      );
+
+      removeInlineKeyboard(chatId, messageId);
+    }
+  }
+}
+
+// ==============================================================================
+// 3. OPENAI MULTIMODAL PARSER (GPT-4o-mini)
 // ==============================================================================
 function parseExpenseWithOpenAI(textPrompt, base64Image, mimeType) {
   const url = "https://api.openai.com/v1/chat/completions";
 
-  const systemInstruction = `You are a financial transaction parser for a user in Singapore.
+  const systemInstruction = `You are a financial bot for a user in Singapore.
 
-Extract transaction details and classify expenses into EXACTLY ONE of these categories:
+Extract transaction details and classify into EXACTLY ONE of these specific subcategories based on intent:
 
-1. "Variable Monthly Needs" - Essentials, food, transport, groceries, household expenses.
-2. "Variable Investments" - Stocks, crypto, investments, extra savings.
-3. "Variable Monthly Wants" - Shopping, gadgets, entertainment, luxury purchases.
+1. "Variable Monthly Needs" (Day-to-day essentials, food, transport, groceries)
+2. "Variable Investments" (Ad-hoc stocks, crypto, extra savings)
+3. "Variable Monthly Wants" (Shopping, gadgets, entertainment, luxury)
 
-TRANSACTION TYPES:
-- Card purchase
-- PayNow transfer
-- Bank transfer
-- FAST transfer
-- Cash withdrawal
-- Refund
-- Bill payment
-- Other
+Also extract the payment method.
 
-IMPORTANT: Understand the underlying economic purpose, not merely the banking mechanism.
-
-TRANSFER RULES:
-- A bank notification may identify a recipient but not what the money was actually spent on.
-- The recipient is NOT necessarily the merchant.
-- A PayNow transfer to a person could represent a shared purchase, dinner, reimbursement, or transfer to the user's own account.
-- Never assume the purpose based on the recipient's name.
-- If a transfer's underlying purpose is not explicitly stated, set needs_clarification to true.
-- If the user explicitly states the purpose, classify that purpose normally.
-- Example: "PayNow $500 to friend for Adidas shoes" means description "Adidas shoes", category "Variable Monthly Wants".
-- Example: "PayNow $500 to friend" has unknown purpose and needs clarification.
-- Example: "Transfer to my own savings account" is an internal transfer, not spending. Set needs_clarification to true.
-
-DESCRIPTION:
-- For purchases, describe what was bought, not just how it was paid.
-- Use concise descriptions such as "Adidas shoes", "Dinner", "Groceries".
-- Do not use generic descriptions such as "PayNow transfer" when the underlying purpose is unknown.
-- Do not invent a purchase purpose.
-- If the purpose is unknown, leave description empty.
-
-MERCHANT AND COUNTERPARTY:
-- merchant means the actual shop or business where the purchase happened.
-- counterparty means the person or account receiving a transfer.
-- Never treat a person's name as a merchant.
-- If a bank notification contains a recipient, extract it as counterparty.
-- Do not store NRIC, FIN, or personal identification numbers.
-- Do not store full bank account numbers.
-
-PAYMENT METHOD:
+Payment method rules:
 - Identify the card, account, or payment method used.
-- Examples: "DBS Visa", "UOB One", "OCBC FRANK Account (4001)", "OCBC Debit", "Apple Pay", "Cash", "PayNow".
-- If Apple Pay is used and the underlying card is identifiable, prefer the card name.
+- Examples: "DBS Visa", "UOB One", "OCBC Debit", "Apple Pay", "Cash", "PayNow".
+- If Apple Pay is used and the underlying card is identifiable, return the card name rather than simply "Apple Pay".
+- If both wallet and underlying card are identifiable, prefer the underlying card.
 - Never infer payment method from the merchant.
-- Return an empty string if unknown.
-- Retain at most the last four digits of an account number.
+- Return an empty string if payment method cannot be identified.
+- Preserve the recognizable card or account name.
 
-CATEGORY:
-- If the underlying purchase purpose is unknown, do not guess a category.
-- Set subcategory to an empty string and needs_clarification to true.
-- If a transaction is clearly an internal transfer, set needs_clarification to true.
-
-Return strictly JSON:
+Return strictly JSON with this exact schema:
 {
+  "subcategory": "Variable Monthly Needs" | "Variable Investments" | "Variable Monthly Wants",
   "amount": <number>,
-  "transaction_type": "<transaction type>",
-  "description": "<underlying purchase description; empty if unknown>",
-  "merchant": "<actual shop/business; empty if unknown>",
-  "counterparty": "<transfer recipient; empty if unknown>",
-  "payment_method": "<payment method; empty if unknown>",
-  "subcategory": "<Variable Monthly Needs | Variable Investments | Variable Monthly Wants | empty string>",
-  "needs_clarification": <true or false>
+  "description": "<short exact description of purchase>",
+  "merchant": "<store/merchant name only, without the item; empty string if none is identifiable>",
+  "payment_method": "<payment method; empty string if unknown>"
 }`;
 
   const userContent = [];
@@ -358,7 +383,7 @@ Return strictly JSON:
     temperature: 0.1
   };
 
-  const response = UrlFetchApp.fetch(url, {
+  const options = {
     method: "post",
     headers: {
       "Authorization": `Bearer ${OPENAI_API_KEY}`,
@@ -366,539 +391,33 @@ Return strictly JSON:
     },
     payload: JSON.stringify(payload),
     muteHttpExceptions: true
-  });
+  };
 
+  const response = UrlFetchApp.fetch(url, options);
   const code = response.getResponseCode();
   const body = response.getContentText();
 
   if (code !== 200) {
     Logger.log(`OpenAI HTTP ${code}: ${body.substring(0, 1000)}`);
-    throw new Error("OpenAI parser request failed");
-  }
-
-  const json = JSON.parse(body);
-
-  if (
-    json.choices &&
-    json.choices[0] &&
-    json.choices[0].message
-  ) {
-    return JSON.parse(json.choices[0].message.content);
-  }
-
-  throw new Error("OpenAI returned no choices");
-}
-
-// ==============================================================================
-// 3. PENDING TRANSACTION STORAGE
-// ==============================================================================
-
-// Each Telegram chat has one pending transaction.
-// Stored in Apps Script Project Properties, not Google Sheets.
-
-function getPendingKey(chatId) {
-  return "PENDING_TRANSACTION_" + chatId;
-}
-
-function getPendingTransactionState(chatId) {
-  const props = PropertiesService.getScriptProperties();
-  const key = getPendingKey(chatId);
-  const raw = props.getProperty(key);
-
-  if (!raw) {
-    return { status: "none", transaction: null };
-  }
-
-  try {
-    const pending = JSON.parse(raw);
-
-    if (Date.now() - pending.createdAt > PENDING_EXPIRY_MS) {
-      props.deleteProperty(key);
-      return { status: "expired", transaction: null };
-    }
-
-    return { status: "active", transaction: pending };
-
-  } catch (err) {
-    props.deleteProperty(key);
-    Logger.log("Invalid pending transaction removed: " + err.toString());
-
-    return { status: "none", transaction: null };
-  }
-}
-
-function getPendingTransaction(chatId) {
-  const state = getPendingTransactionState(chatId);
-  return state.status === "active" ? state.transaction : null;
-}
-
-function hasPendingTransaction(chatId) {
-  return getPendingTransactionState(chatId).status === "active";
-}
-
-function savePendingTransaction(chatId, parsed) {
-  const lock = LockService.getScriptLock();
-
-  try {
-    lock.waitLock(10000);
-
-    const existing = getPendingTransactionState(chatId);
-
-    if (existing.status === "active") {
-      throw new Error("A pending transaction already exists for this chat");
-    }
-
-    const pending = {
-      createdAt: Date.now(),
-      amount: parsed.amount,
-      transaction_type: parsed.transaction_type || "Transaction",
-      description: parsed.description || "",
-      merchant: parsed.merchant || "",
-      counterparty: parsed.counterparty || "",
-      payment_method: sanitisePaymentMethod(parsed.payment_method || "")
-    };
-
-    PropertiesService.getScriptProperties().setProperty(
-      getPendingKey(chatId),
-      JSON.stringify(pending)
-    );
-
-  } finally {
-    if (lock.hasLock()) lock.releaseLock();
-  }
-}
-
-function clearPendingTransaction(chatId) {
-  const lock = LockService.getScriptLock();
-
-  try {
-    lock.waitLock(10000);
-
-    const props = PropertiesService.getScriptProperties();
-    const key = getPendingKey(chatId);
-    const existed = props.getProperty(key) !== null;
-
-    props.deleteProperty(key);
-
-    return existed;
-
-  } finally {
-    if (lock.hasLock()) lock.releaseLock();
-  }
-}
-
-// ==============================================================================
-// 4. ASK FOR CLARIFICATION
-// ==============================================================================
-function askTransactionPurpose(chatId, pending) {
-  let message =
-    `❓ *A quick clarification before I log this transaction*\n\n` +
-    `💰 *Amount:* $${pending.amount.toFixed(2)}\n` +
-    `🔄 *Transaction:* ${escapeMd(pending.transaction_type)}\n`;
-
-  if (pending.counterparty) {
-    message += `👤 *Recipient:* ${escapeMd(pending.counterparty)}\n`;
-  }
-
-  if (pending.merchant) {
-    message += `🏪 *Merchant:* ${escapeMd(pending.merchant)}\n`;
-  }
-
-  if (pending.payment_method) {
-    message += `💳 *Payment Method:* ${escapeMd(pending.payment_method)}\n`;
-  }
-
-  message +=
-    `\n*What was this transaction actually for?*\n\n` +
-    `For example:\n` +
-    `• Adidas shoes\n` +
-    `• Dinner with friends\n` +
-    `• Groceries\n` +
-    `• Transfer to my own account\n\n` +
-    `Reply with the purpose in plain text. I'll determine the description and budget category.\n\n` +
-    `_Nothing has been logged yet. Send /cancel to discard._`;
-
-  sendTelegramMessage(chatId, message);
-}
-
-// ==============================================================================
-// 5. PROCESS CLARIFICATION REPLY
-// ==============================================================================
-function handleClarificationReply(chatId, answer) {
-  const pending = getPendingTransaction(chatId);
-
-  if (!pending) {
-    sendTelegramMessage(
-      chatId,
-      "⌛ The pending transaction has expired. Please resend the transaction if you still want to record it."
-    );
-    return;
-  }
-
-  let resolution;
-
-  try {
-    resolution = resolvePendingTransaction(pending, answer);
-
-  } catch (err) {
-    Logger.log("Clarification resolution failed: " + err.toString());
-
-    sendTelegramMessage(
-      chatId,
-      "⚠️ I couldn't process your answer. Your pending transaction is still saved. Please try again."
-    );
-
-    return;
-  }
-
-  // Ask another question if the answer is still unclear.
-  if (!resolution || resolution.resolved !== true) {
-    const question =
-      resolution && resolution.clarification_question
-        ? resolution.clarification_question
-        : "Could you clarify what the money was used for?";
-
-    sendTelegramMessage(
-      chatId,
-      `🤔 ${escapeMd(question)}\n\n_Reply with more detail, or send /cancel._`
-    );
-
-    return;
-  }
-
-  // Internal transfer: do not count as spending.
-  if (resolution.exclude === true) {
-    clearPendingTransaction(chatId);
-
-    sendTelegramMessage(
-      chatId,
-      `↪️ *Not logged as an expense.*\n\n` +
-      `I've treated this as a transfer rather than spending.\n\n` +
-      `💰 Amount: $${pending.amount.toFixed(2)}\n` +
-      `_Your budget and tracker have not been changed._`
-    );
-
-    return;
-  }
-
-  const validCategories = [
-    "Variable Monthly Needs",
-    "Variable Investments",
-    "Variable Monthly Wants"
-  ];
-
-  if (
-    validCategories.indexOf(resolution.subcategory) === -1 ||
-    !resolution.description
-  ) {
-    sendTelegramMessage(
-      chatId,
-      "🤔 I still need a clearer description of what you purchased. What was the money used for?"
-    );
-
-    return;
-  }
-
-  const finalTransaction = {
-    amount: pending.amount,
-    description: resolution.description,
-    subcategory: resolution.subcategory,
-    merchant: pending.merchant || "",
-    counterparty: pending.counterparty || "",
-    payment_method: pending.payment_method || ""
-  };
-
-  // Save first. Only clear pending after successful sheet write.
-  const rowNumber = saveExpenseToSheet(finalTransaction);
-
-  if (!rowNumber) {
-    sendTelegramMessage(
-      chatId,
-      "⚠️ I understood your answer but couldn't save the transaction. Your pending transaction is retained; please try replying again."
-    );
-
-    return;
-  }
-
-  clearPendingTransaction(chatId);
-
-  const replyMsg = buildLoggedMessage(
-    "✅ *Clarification received — logged!*",
-    finalTransaction.description,
-    finalTransaction.subcategory,
-    finalTransaction.amount,
-    finalTransaction.merchant,
-    "",
-    finalTransaction.payment_method,
-    finalTransaction.counterparty
-  );
-
-  sendTelegramWithButtons(chatId, replyMsg, rowNumber);
-}
-
-// ==============================================================================
-// 6. AI CLARIFICATION RESOLVER
-// ==============================================================================
-function resolvePendingTransaction(pending, answer) {
-  const url = "https://api.openai.com/v1/chat/completions";
-
-  const systemInstruction = `You resolve missing information for a financial transaction in Singapore.
-
-ORIGINAL BANK TRANSACTION:
-${JSON.stringify(pending)}
-
-USER'S CLARIFICATION:
-${answer}
-
-Determine what the money was actually spent on.
-
-ALLOWED CATEGORIES:
-- Variable Monthly Needs: essentials, food, transport, groceries, household expenses.
-- Variable Investments: stocks, crypto, investments, extra savings.
-- Variable Monthly Wants: shopping, gadgets, entertainment, luxury purchases.
-
-EXAMPLES:
-- "Adidas shoes" => description "Adidas shoes", Variable Monthly Wants.
-- "Shared purchase of Adidas goods" => description "Adidas shopping", Variable Monthly Wants.
-- "Dinner" => description "Dinner", Variable Monthly Needs.
-- "Groceries" => description "Groceries", Variable Monthly Needs.
-- "Transferred to my own savings account" => exclude true.
-- "Moved money between my own accounts" => exclude true.
-- "Invested in shares" => description "Shares investment", Variable Investments.
-
-RULES:
-- Do not confuse the recipient with the merchant.
-- Do not assume a transfer is an expense.
-- Only exclude a transaction when the user clearly indicates it is an internal transfer or not spending.
-- If the answer is too vague to identify the purpose, set resolved to false and ask a concise follow-up question.
-- If the category is unclear, ask rather than guess.
-- Do not change the original transaction amount or payment method.
-- Do not invent merchant names.
-- The description should identify the underlying purchase or purpose, not the transfer mechanism.
-
-Return strictly JSON:
-{
-  "resolved": <true or false>,
-  "exclude": <true or false>,
-  "description": "<concise expense description>",
-  "subcategory": "<Variable Monthly Needs | Variable Investments | Variable Monthly Wants | empty string>",
-  "clarification_question": "<short follow-up question if unresolved; otherwise empty string>"
-}`;
-
-  const payload = {
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: systemInstruction },
-      { role: "user", content: answer }
-    ],
-    response_format: { type: "json_object" },
-    temperature: 0.1
-  };
-
-  const response = UrlFetchApp.fetch(url, {
-    method: "post",
-    headers: {
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  });
-
-  if (response.getResponseCode() !== 200) {
-    Logger.log("Clarification API error: " + response.getContentText().substring(0, 1000));
-    throw new Error("OpenAI clarification request failed");
-  }
-
-  const json = JSON.parse(response.getContentText());
-
-  if (!json.choices || !json.choices[0] || !json.choices[0].message) {
-    throw new Error("OpenAI returned no clarification result");
-  }
-
-  return JSON.parse(json.choices[0].message.content);
-}
-
-// ==============================================================================
-// 7. SAVE EXPENSE TO GOOGLE SHEETS
-// ==============================================================================
-function saveExpenseToSheet(parsed) {
-  const lock = LockService.getScriptLock();
-
-  try {
-    lock.waitLock(10000);
-
-    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-    const trackerSheet = ss.getSheetByName(TRACKER_TAB);
-
-    if (!trackerSheet) {
-      throw new Error("Tracker sheet not found: " + TRACKER_TAB);
-    }
-
-    const todayStr = Utilities.formatDate(
-      new Date(),
-      Session.getScriptTimeZone(),
-      "yyyy-MM-dd"
-    );
-
-    // A: Date
-    // B: Subcategory
-    // C: Amount
-    // D: Description
-    // E: Source
-    // F: Payment Method
-    trackerSheet.appendRow([
-      todayStr,
-      parsed.subcategory,
-      parsed.amount,
-      parsed.description,
-      "Telegram Bot",
-      parsed.payment_method || ""
-    ]);
-
-    SpreadsheetApp.flush();
-
-    return trackerSheet.getLastRow();
-
-  } catch (err) {
-    Logger.log("Sheet write failed: " + err.toString());
     return null;
-
-  } finally {
-    if (lock.hasLock()) lock.releaseLock();
   }
+
+  const jsonRes = JSON.parse(body);
+
+  if (
+    jsonRes.choices &&
+    jsonRes.choices[0] &&
+    jsonRes.choices[0].message
+  ) {
+    return JSON.parse(jsonRes.choices[0].message.content);
+  }
+
+  Logger.log("OpenAI returned no choices: " + body.substring(0, 1000));
+  return null;
 }
 
 // ==============================================================================
-// 8. BUTTON CALLBACK PROCESSOR
-// ==============================================================================
-function handleCallbackQuery(callback) {
-  const callbackId = callback.id;
-  const chatId = callback.message.chat.id;
-  const messageId = callback.message.message_id;
-  const actionData = callback.data;
-
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const trackerSheet = ss.getSheetByName(TRACKER_TAB);
-
-  if (!trackerSheet) {
-    answerCallbackQuery(callbackId, "Tracker sheet not found.");
-    return;
-  }
-
-  // Confirm.
-  if (actionData.startsWith("confirm_")) {
-    answerCallbackQuery(callbackId, "✅ Locked & Confirmed!");
-    removeInlineKeyboard(chatId, messageId);
-    return;
-  }
-
-  answerCallbackQuery(callbackId);
-
-  // MCC lookup.
-  if (actionData.startsWith("mcc_")) {
-    const rowNum = parseInt(actionData.split("_")[1], 10);
-
-    if (rowNum > 1 && rowNum <= trackerSheet.getLastRow()) {
-      const subcat = trackerSheet.getRange(rowNum, 2).getValue();
-      const amount = parseFloat(trackerSheet.getRange(rowNum, 3).getValue());
-      const desc = trackerSheet.getRange(rowNum, 4).getValue();
-      const paymentMethod = trackerSheet.getRange(rowNum, 6).getValue();
-
-      const msgText = callback.message.text || "";
-      const merchant = extractField(msgText, "Merchant");
-      const counterparty = extractField(msgText, "Recipient");
-      const mccText = formatMccResults(lookupMcc(merchant || desc));
-
-      const updatedMsg = buildLoggedMessage(
-        "✅ *Logged Expense!*",
-        desc,
-        subcat,
-        amount,
-        merchant,
-        mccText,
-        paymentMethod,
-        counterparty
-      );
-
-      editTelegramMessage(
-        chatId,
-        messageId,
-        updatedMsg,
-        buildKeyboard(rowNum, false)
-      );
-    }
-
-    return;
-  }
-
-  // Reclassify.
-  if (actionData.startsWith("reclass_")) {
-    const firstUnderscore = actionData.indexOf("_");
-    const secondUnderscore = actionData.indexOf("_", firstUnderscore + 1);
-
-    const rowNum = parseInt(
-      actionData.substring(firstUnderscore + 1, secondUnderscore),
-      10
-    );
-
-    const newSubcat = actionData.substring(secondUnderscore + 1);
-
-    if (rowNum > 1 && rowNum <= trackerSheet.getLastRow()) {
-      trackerSheet.getRange(rowNum, 2).setValue(newSubcat);
-      SpreadsheetApp.flush();
-
-      const itemDesc = trackerSheet.getRange(rowNum, 4).getValue();
-      const amount = parseFloat(trackerSheet.getRange(rowNum, 3).getValue());
-      const paymentMethod = trackerSheet.getRange(rowNum, 6).getValue();
-
-      const msgText = callback.message.text || "";
-      const merchant = extractField(msgText, "Merchant");
-      const counterparty = extractField(msgText, "Recipient");
-      const mccText = extractField(msgText, "MCC");
-
-      const updatedMsg = buildLoggedMessage(
-        "✏️ *Reclassified & Locked!*",
-        itemDesc,
-        newSubcat,
-        amount,
-        merchant,
-        mccText,
-        paymentMethod,
-        counterparty
-      );
-
-      editTelegramMessage(chatId, messageId, updatedMsg);
-      removeInlineKeyboard(chatId, messageId);
-    }
-
-    return;
-  }
-
-  // Delete / Undo.
-  if (actionData.startsWith("delete_")) {
-    const rowNum = parseInt(actionData.split("_")[1], 10);
-
-    if (rowNum > 1 && rowNum <= trackerSheet.getLastRow()) {
-      const itemDesc = trackerSheet.getRange(rowNum, 4).getValue();
-      const amount = trackerSheet.getRange(rowNum, 3).getValue();
-
-      trackerSheet.deleteRow(rowNum);
-      SpreadsheetApp.flush();
-
-      editTelegramMessage(
-        chatId,
-        messageId,
-        `🗑️ *Deleted!* Removed *$${amount}* (${escapeMd(itemDesc)}) from your tracker.`
-      );
-
-      removeInlineKeyboard(chatId, messageId);
-    }
-  }
-}
-
-// ==============================================================================
-// 9. MCC LOOKUP
+// 4. MCC LOOKUP
 // ==============================================================================
 function lookupMcc(query) {
   if (!query) return [];
@@ -948,31 +467,18 @@ function formatMccResults(results) {
 }
 
 // ==============================================================================
-// 10. MESSAGE / TEXT HELPERS
+// 5. MESSAGE / TEXT HELPERS
 // ==============================================================================
 function escapeMd(s) {
-  return String(s || "").replace(/([_*`\[])/g, "\\$1");
+  return String(s).replace(/([_*`\[])/g, "\\$1");
 }
 
 function extractField(text, label) {
-  // Supports Telegram Markdown such as *Merchant:* Adidas.
-  const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
   const m = (text || "").match(
-    new RegExp(escapedLabel + ":\\*? (.+)")
+    new RegExp(label + ": (.+)")
   );
 
   return m ? m[1].trim() : "";
-}
-
-function sanitisePaymentMethod(value) {
-  let method = String(value || "");
-
-  // Remove long digit sequences, preserving at most a trailing four-digit
-  // account/card reference where the model has included one.
-  method = method.replace(/\d{5,}/g, match => match.slice(-4));
-
-  return method.trim();
 }
 
 function buildLoggedMessage(
@@ -982,8 +488,7 @@ function buildLoggedMessage(
   amount,
   merchant,
   mccText,
-  paymentMethod,
-  counterparty
+  paymentMethod
 ) {
   const stats = getSubcategoryStats(subcategory);
 
@@ -991,7 +496,6 @@ function buildLoggedMessage(
     `${header}\n\n` +
     `📝 *Item:* ${escapeMd(description)}\n` +
     (merchant ? `🏪 *Merchant:* ${escapeMd(merchant)}\n` : "") +
-    (counterparty ? `👤 *Recipient:* ${escapeMd(counterparty)}\n` : "") +
     (paymentMethod ? `💳 *Payment Method:* ${escapeMd(paymentMethod)}\n` : "") +
     (mccText ? `🔎 *MCC:* ${escapeMd(mccText)}\n` : "") +
     `🏷️ *Bucket:* ${subcategory}\n` +
@@ -1002,7 +506,7 @@ function buildLoggedMessage(
 }
 
 // ==============================================================================
-// 11. SHEET STATS HELPER
+// 6. SHEET STATS HELPER
 // ==============================================================================
 function getSubcategoryStats(subcategory) {
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
@@ -1032,6 +536,7 @@ function getSubcategoryStats(subcategory) {
     ).getDate();
 
     const daysLeft = totalDaysInMonth - now.getDate() + 1;
+
     const spentToday = getSpentToday(ss, subcategory);
 
     const dailyRate = (remaining + spentToday) / daysLeft;
@@ -1048,6 +553,7 @@ function getSubcategoryStats(subcategory) {
   };
 }
 
+// Sum of today's tracker rows for a subcategory
 function getSpentToday(ss, subcategory) {
   const sheet = ss.getSheetByName(TRACKER_TAB);
   const lastRow = sheet.getLastRow();
@@ -1080,7 +586,7 @@ function getSpentToday(ss, subcategory) {
 }
 
 // ==============================================================================
-// 12. DAILY MORNING SUMMARY TRIGGER
+// 7. DAILY MORNING SUMMARY TRIGGER (8:00 AM)
 // ==============================================================================
 function sendDailySummary() {
   const needsStats = getSubcategoryStats("Variable Monthly Needs");
@@ -1110,7 +616,7 @@ function sendDailySummary() {
 }
 
 // ==============================================================================
-// 13. TELEGRAM KEYBOARDS AND API UTILITIES
+// 8. TELEGRAM API UTILITIES
 // ==============================================================================
 function buildKeyboard(rowNumber, includeMcc) {
   const keyboard = [
@@ -1201,7 +707,7 @@ function removeInlineKeyboard(chatId, messageId) {
   });
 }
 
-function answerCallbackQuery(callbackId, text) {
+function answerCallbackQuery(callbackId, text = "") {
   const payload = {
     callback_query_id: callbackId
   };
@@ -1221,7 +727,7 @@ function answerCallbackQuery(callbackId, text) {
 function sendTelegramMessage(chatId, text) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
 
-  const res = UrlFetchApp.fetch(url, {
+  UrlFetchApp.fetch(url, {
     method: "post",
     contentType: "application/json",
     payload: JSON.stringify({
@@ -1231,14 +737,10 @@ function sendTelegramMessage(chatId, text) {
     }),
     muteHttpExceptions: true
   });
-
-  if (res.getResponseCode() !== 200) {
-    Logger.log("Telegram sendMessage failed: " + res.getContentText());
-  }
 }
 
 // ==============================================================================
-// 14. SETUP UTILITIES
+// 9. SETUP UTILITIES
 // ==============================================================================
 function setTelegramWebhook() {
   const callbackUrl =
@@ -1252,9 +754,9 @@ function setTelegramWebhook() {
 }
 
 function setupDailyTrigger() {
-  ScriptApp.getProjectTriggers().forEach(trigger => {
-    if (trigger.getHandlerFunction() === "sendDailySummary") {
-      ScriptApp.deleteTrigger(trigger);
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === "sendDailySummary") {
+      ScriptApp.deleteTrigger(t);
     }
   });
 
